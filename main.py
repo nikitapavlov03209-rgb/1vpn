@@ -9,7 +9,6 @@ import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
-from sqlalchemy.orm import Session
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (Message, CallbackQuery, InlineKeyboardMarkup,
@@ -19,7 +18,8 @@ from aiogram.client.default import DefaultBotProperties  # aiogram >= 3.7
 
 from sqlalchemy import (create_engine, Column, Integer, String, Boolean, Float,
                         DateTime, ForeignKey, Text, UniqueConstraint)
-from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship, Session  # <-- Добавлено
+
 from urllib.parse import urlparse, parse_qs, unquote
 
 # ===================== ENV & DB =====================
@@ -165,6 +165,10 @@ def get_or_create_user(tg_id: int) -> User:
     finally:
         db.close()
 
+# Создаем объект FastAPI
+api = FastAPI(title="VPN Subscription API")
+
+# ===================== XUI SYNC (опционально) =====================
 def fetch_servers_from_xui(api_url: str, api_token: str, db: Session):
     headers = {
         'Authorization': f'Bearer {api_token}'
@@ -212,40 +216,6 @@ def seed_servers_if_empty():
 # ===================== BOT =====================
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
-
-ADMIN_SESSIONS: Dict[int, Dict] = {}
-PAY_INTENT: Dict[int, str] = {}  # tg_id -> план (30d|90d|270d)
-
-async def check_membership(user_id: int) -> bool:
-    try:
-        member = await bot.get_chat_member(CHANNEL_ID, user_id)
-        return member.status in ("creator", "administrator", "member")
-    except Exception:
-        return False
-
-def main_menu(is_admin_flag: bool=False) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text="👤 Профиль", callback_data="profile"),
-         InlineKeyboardButton(text="🔗 Подписка", callback_data="keys")],
-        [InlineKeyboardButton(text="💼 Баланс / Пополнить", callback_data="wallet")],
-        [InlineKeyboardButton(text="🛒 Купить подписку", callback_data="pay_menu")],
-        [InlineKeyboardButton(text="🆘 Поддержка", url="https://t.me/your_support")],
-    ]
-    if is_admin_flag:
-        rows.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="admin")])
-    rows.append([InlineKeyboardButton(text="ℹ️ О проекте", callback_data="about"),
-                 InlineKeyboardButton(text="❓ Как использовать", callback_data="howto")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-def gate_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[ 
-        [InlineKeyboardButton(text="📢 Подписаться на канал", url=f"https://t.me/{CHANNEL_ID.lstrip('@')}")],
-        [InlineKeyboardButton(text="🔄 Проверить подписку", callback_data="check_sub")],
-        [InlineKeyboardButton(text="🔐 Условия использования", url=TOS_URL)],
-        [InlineKeyboardButton(text="✅ Согласен с условиями", callback_data="agree_tos")],
-    ])
-
-# ---- все остальные части бота остаются такими же, как были до этого ----
 
 # ===================== ENTRY =====================
 if __name__ == "__main__":

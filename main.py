@@ -9,6 +9,7 @@ import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
+from sqlalchemy.orm import Session
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (Message, CallbackQuery, InlineKeyboardMarkup,

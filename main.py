@@ -251,3 +251,16 @@ async def start(msg: Message):
         await msg.answer(text, reply_markup=gate_kb())
         return
     await msg.answer("<b>Главное меню</b>", reply_markup=main_menu(is_admin(msg.from_user.id)))
+
+# ===================== Запуск сервера FastAPI =====================
+from threading import Thread
+def run_api():
+    import uvicorn
+    uvicorn.run(api, host="0.0.0.0", port=8000, log_level="info")
+
+Thread(target=run_api, daemon=True).start()
+
+# ===================== Запуск бота =====================
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(dp.start_polling(bot))

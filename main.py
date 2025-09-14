@@ -194,6 +194,21 @@ def _split_lines_from_subscription(content: bytes) -> List[str]:
         txt = str(content)
     return [ln.strip() for ln in txt.splitlines() if "://" in ln]
 
+# ===================== API =====================
+# Создание экземпляра FastAPI
+api = FastAPI(title="VPN Subscription API")
+
+@api.get("/s/{token}", response_class=PlainTextResponse)
+def subscription(token: str):
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter_by(sub_token=token).one_or_none()
+        if not user:
+            raise HTTPException(status_code=404, detail="Invalid token")
+        return PlainTextResponse(build_subscription_text(user), media_type="text/plain; charset=utf-8")
+    finally:
+        db.close()
+
 # ===================== BOT =====================
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()

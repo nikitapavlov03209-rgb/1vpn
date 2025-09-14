@@ -243,10 +243,9 @@ async def start_polling():
 if __name__ == "__main__":
     import uvicorn
 
-    # Запуск FastAPI сервера в асинхронном цикле
+    # Запуск FastAPI сервера и бота в одном процессе
     async def main():
         import asyncio
-        # Запуск бота и API в одном процессе
         from threading import Thread
         Thread(target=lambda: uvicorn.run(api, host="0.0.0.0", port=8000)).start()
         await start_polling()

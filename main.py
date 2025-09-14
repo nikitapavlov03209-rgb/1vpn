@@ -20,6 +20,7 @@ from sqlalchemy import (create_engine, Column, Integer, String, Boolean, Float,
                         DateTime, ForeignKey, Text, UniqueConstraint)
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from urllib.parse import urlparse, parse_qs, unquote
+import asyncio
 
 # ===================== ENV & DB ===================== 
 load_dotenv()
@@ -195,7 +196,6 @@ def _split_lines_from_subscription(content: bytes) -> List[str]:
     return [ln.strip() for ln in txt.splitlines() if "://" in ln]
 
 # ===================== API =====================
-# Создание экземпляра FastAPI
 api = FastAPI(title="VPN Subscription API")
 
 @api.get("/s/{token}", response_class=PlainTextResponse)
@@ -213,60 +213,42 @@ def subscription(token: str):
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
-# Привязка серверов пользователю при создании подписки
-def assign_all_servers_to_user(user: User):
-    db = SessionLocal()
+async def check_membership(user_id: int) -> bool:
     try:
-        current = {us.server_id for us in db.query(UserServer).filter_by(user_id=user.id).all()}
-        for s in db.query(Server).filter_by(enabled=True).all():
-            if s.id not in current:
-                db.add(UserServer(user_id=user.id, server_id=s.id))
-        db.commit()
-    finally:
-        db.close()
+        member = await bot.get_chat_member(CHANNEL_ID, user_id)
+        return member.status in ("creator", "administrator", "member")
+    except Exception:
+        return False
 
-# Генерация подписки
-def build_subscription_text(user: User) -> str:
-    if not user.subscription_expires_at or user.subscription_expires_at < datetime.utcnow():
-        return ""
-    db = SessionLocal()
-    try:
-        servers = (
-            db.query(Server)
-              .join(UserServer, Server.id == UserServer.server_id)
-              .filter(UserServer.user_id == user.id, Server.enabled == True)
-              .all()
-        )
-        lines = [build_uri(s) for s in servers]
-        return "\n".join(lines) + "\n"
-    finally:
-        db.close()
-
-# Создание подписки для пользователя
-@dp.callback_query(F.data == "keys")
-async def cb_keys(c: CallbackQuery):
-    user = get_or_create_user(c.from_user.id)
-    sub_url = f"{BASE_URL}/s/{user.sub_token}"
-    await c.message.edit_text(
-        "Импортируйте ссылку в V2RayN/V2RayNG/Shadowrocket/NekoRay:\n"
-        f"<code>{sub_url}</code>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="back")]]),
-    )
-    await c.answer()
+def main_menu(is_admin_flag: bool=False) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="👤 Профиль", callback_data="profile"),
+         InlineKeyboardButton(text="🔗 Подписка", callback_data="keys")],
+        [InlineKeyboardButton(text="💼 Баланс / Пополнить", callback_data="wallet")],
+        [InlineKeyboardButton(text="🛒 Купить подписку", callback_data="pay_menu")],
+        [InlineKeyboardButton(text="🆘 Поддержка", url="https://t.me/your_support")],
+    ]
+    if is_admin_flag:
+        rows.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="admin")])
+    rows.append([InlineKeyboardButton(text="ℹ️ О проекте", callback_data="about"),
+                 InlineKeyboardButton(text="❓ Как использовать", callback_data="howto")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 # ===================== ENTRY =====================
+async def start_polling():
+    print("Bot started")
+    # Запуск бота и API в одном цикле asyncio
+    await dp.start_polling(bot)
+
 if __name__ == "__main__":
-    import asyncio
-    from threading import Thread
+    import uvicorn
 
-    def run_api():
-        import uvicorn
-        uvicorn.run(api, host="0.0.0.0", port=8000, log_level="info")
-
-    Thread(target=run_api, daemon=True).start()
-
+    # Запуск FastAPI сервера в асинхронном цикле
     async def main():
-        print("Bot started")
-        await dp.start_polling(bot)
+        import asyncio
+        # Запуск бота и API в одном процессе
+        from threading import Thread
+        Thread(target=lambda: uvicorn.run(api, host="0.0.0.0", port=8000)).start()
+        await start_polling()
 
     asyncio.run(main())

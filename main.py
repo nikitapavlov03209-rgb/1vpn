@@ -148,79 +148,48 @@ def ensure_default_plans():
 
 run_light_migrations()
 
-# ===================== UTILS =====================
-def get_or_create_user(tg_id: int) -> User:
-    db = SessionLocal()
-    try:
-        u = db.query(User).filter_by(tg_id=tg_id).one_or_none()
-        if not u:
-            u = User(
-                tg_id=tg_id,
-                is_admin=(tg_id in ADMIN_IDS),
-                sub_token=secrets.token_urlsafe(24),
-                subscription_expires_at=None
-            )
-            db.add(u); db.commit()
-        return u
-    finally:
-        db.close()
-
-# Создаем объект FastAPI
-api = FastAPI(title="VPN Subscription API")
-
-# ===================== XUI SYNC (опционально) =====================
-def fetch_servers_from_xui(api_url: str, api_token: str, db: Session):
-    headers = {
-        'Authorization': f'Bearer {api_token}'
-    }
-    try:
-        response = requests.get(f"{api_url}/api/servers", headers=headers)
-        response.raise_for_status()  # Поднимет исключение, если запрос не удался
-        servers = response.json().get("data", [])
-        
-        # Проходим по каждому серверу и добавляем в базу данных
-        for server in servers:
-            # Преобразуем данные сервера в формат json_data
-            json_data = json.dumps({
-                "uuid": server.get("uuid"),
-                "host": server.get("host"),
-                "port": server.get("port", 443),
-                "security": server.get("security", "tls"),
-                "sni": server.get("sni", server.get("host")),
-                "type": server.get("type", "ws"),
-                "path": server.get("path", "/"),
-                "tag": server.get("tag", server.get("name"))
-            })
-
-            # Создаем сервер в базе данных
-            new_server = Server(
-                name=server.get("name"),
-                protocol=server.get("protocol"),
-                json_data=json_data
-            )
-            db.add(new_server)
-        db.commit()
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching servers: {e}")
-
-# ===================== DEMO SERVERS =====================
-def seed_servers_if_empty():
-    db = SessionLocal()
-    try:
-        if db.query(Server).count() == 0:
-            # Синхронизация с 3x-UI
-            fetch_servers_from_xui("http://your-xui-server-ip:port", "your-api-token", db)
-    finally:
-        db.close()
-
 # ===================== BOT =====================
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
-# ===================== ENTRY =====================
-if __name__ == "__main__":
-    seed_servers_if_empty()
+# ===================== FASTAPI: подписка =====================
+api = FastAPI(title="VPN Subscription API")
 
+@api.get("/s/{token}", response_class=PlainTextResponse)
+def subscription(token: str):
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter_by(sub_token=token).one_or_none()
+        if not user:
+            raise HTTPException(status_code=404, detail="Invalid token")
+        return PlainTextResponse(build_subscription_text(user), media_type="text/plain; charset=utf-8")
+    finally:
+        db.close()
+
+# ===================== BOT Handlers =====================
+
+@dp.message(CommandStart())
+async def start(msg: Message):
+    print(f"Received /start from {msg.from_user.id}")
+    user = get_or_create_user(msg.from_user.id)
+    assign_all_servers_to_user(user)
+    ok_sub = await check_membership(msg.from_user.id)
+    if not ok_sub or not user.accepted_terms:
+        text = ("<b>Добро пожаловать!</b>\n\n"
+                "Для использования бота:\n"
+                "1) Подпишитесь на наш канал\n"
+                "2) Примите условия использования\n\n"
+                "Нажмите «Проверить подписку» после выполнения.")
+        await msg.answer(text, reply_markup=gate_kb())
+        return
+    await msg.answer("<b>Главное меню</b>", reply_markup=main_menu(is_admin(msg.from_user.id)))
+
+
+async def main():
+    print("Bot started")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
     import asyncio
     from threading import Thread
 
@@ -229,9 +198,5 @@ if __name__ == "__main__":
         uvicorn.run(api, host="0.0.0.0", port=8000, log_level="info")
 
     Thread(target=run_api, daemon=True).start()
-
-    async def main():
-        print("Bot started")
-        await dp.start_polling(bot)
 
     asyncio.run(main())

@@ -221,6 +221,21 @@ def assign_all_servers_to_user(user: User):
     finally:
         db.close()
 
+def assign_all_servers_to_everyone():
+    """После добавления новых серверов привязываем их ко всем пользователям."""
+    db = SessionLocal()
+    try:
+        users = db.query(User).all()
+        server_ids = [s.id for s in db.query(Server).filter_by(enabled=True).all()]
+        for u in users:
+            current = {us.server_id for us in db.query(UserServer).filter_by(user_id=u.id).all()}
+            for sid in server_ids:
+                if sid not in current:
+                    db.add(UserServer(user_id=u.id, server_id=sid))
+        db.commit()
+    finally:
+        db.close()
+
 # ---- генерация URI по серверным шаблонам ----
 def build_uri(server: Server) -> str:
     data = json.loads(server.json_data)
@@ -244,7 +259,7 @@ def build_uri(server: Server) -> str:
         return "vmess://" + base64.urlsafe_b64encode(raw.encode()).decode().strip("=")
     if proto == "trojan":
         pw = data["password"]; host=data["host"]; port=data.get("port",443)
-        q=[]; 
+        q=[]
         if data.get("sni"): q.append(f"sni={data['sni']}")
         if data.get("type"): q.append(f"type={data['type']}")
         if data.get("path"): q.append(f"path={data['path']}")
@@ -264,8 +279,6 @@ def build_subscription_text(user: User) -> str:
               .filter(UserServer.user_id == user.id, Server.enabled == True)
               .all()
         )
-        # Если нужны только VLESS, раскомментируй:
-        # servers = [s for s in servers if s.protocol.lower() == "vless"]
         lines = [build_uri(s) for s in servers]
         return "\n".join(lines) + "\n"
     finally:
@@ -285,7 +298,7 @@ def subscription(token: str):
     finally:
         db.close()
 
-# ===================== XUI SYNC (опционально) =====================
+# ===================== XUI SYNC / PARSERS (опционально) =====================
 def _upsert_server(proto: str, name: str, data: dict) -> bool:
     db = SessionLocal()
     try:
@@ -580,7 +593,6 @@ async def cb_buy_from_balance(c: CallbackQuery):
             )
             return
         u.balance -= price
-        # продлеваем
         now = datetime.utcnow()
         start = u.subscription_expires_at if (u.subscription_expires_at and u.subscription_expires_at > now) else now
         u.subscription_expires_at = start + timedelta(days=plan.days)
@@ -634,7 +646,6 @@ def check_crypto_status_topups():
             if p and p.status != "paid" and status == "paid":
                 p.status = "paid"
                 u = db.query(User).filter_by(id=p.user_id).one()
-                # Зачисляем 1:1 (USDT ~ USD)
                 u.balance += float(p.amount)
         db.commit()
     finally:
@@ -642,8 +653,7 @@ def check_crypto_status_topups():
 
 @dp.callback_query(F.data == "topup_crypto")
 async def cb_topup_crypto(c: CallbackQuery):
-    # просто пример фиксированного пополнения
-    amount = 5.00
+    amount = 5.00  # пример фиксированного пополнения
     try:
         url = create_crypto_invoice_topup(amount, c.from_user.id)
         await c.answer()
@@ -697,7 +707,6 @@ def check_yookassa_status_topups():
             if st == "succeeded":
                 p.status = "paid"
                 u = db.query(User).filter_by(id=p.user_id).one()
-                # Конвертируем RUB -> баланс (USD-экв)
                 u.balance += float(p.amount) / EXCHANGE_RUB_PER_USD
         db.commit()
     finally:
@@ -724,6 +733,7 @@ async def cb_admin(c: CallbackQuery):
         [InlineKeyboardButton(text="➕ Пополнить баланс (TG ID)", callback_data="adm_addbal")],
         [InlineKeyboardButton(text="👑 Назначить админа", callback_data="adm_setadmin")],
         [InlineKeyboardButton(text="💲 Изменить цены (30/90/270)", callback_data="adm_prices")],
+        [InlineKeyboardButton(text="➕ Добавить сервер (URI/подписка)", callback_data="adm_add_server")],
         [InlineKeyboardButton(text="🔄 Синхронизировать 3x-ui", callback_data="adm_sync_xui")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
     ])
@@ -776,7 +786,26 @@ async def cb_adm_sync_xui(c: CallbackQuery):
         await c.answer("XUI_SUB_URLS не задан в .env", show_alert=True); return
     await c.answer("Синхронизация…")
     total = sync_from_xui_subscriptions()
+    assign_all_servers_to_everyone()
     await c.message.answer(f"Готово. Обновлено узлов: {total}\nИсточник(и): {', '.join(XUI_SUB_URLS)}")
+
+# ========= НОВОЕ: добавление серверов (URI/подписка) через админ-панель =========
+@dp.callback_query(F.data == "adm_add_server")
+async def cb_adm_add_server(c: CallbackQuery):
+    if not is_admin(c.from_user.id): 
+        await c.answer("Нет доступа", show_alert=True); 
+        return
+    ADMIN_SESSIONS[c.from_user.id] = {"mode": "add_server_wait"}
+    text = (
+        "Вставьте одной или несколькими строками:\n"
+        "• <code>vless://…</code>\n• <code>vmess://…</code>\n• <code>trojan://…</code>\n"
+        "или ссылку на подписку <code>http(s)://…</code> (бот скачает и распарсит).\n\n"
+        "После импорта узлы автоматически попадут к всем пользователям."
+    )
+    await c.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="admin")]
+    ]))
+    await c.answer()
 
 @dp.message()
 async def admin_text_router(msg: Message):
@@ -841,6 +870,61 @@ async def admin_text_router(msg: Message):
             await msg.answer(f"Цены для {plan_code} обновлены: ${usd:.2f} / {int(rub)}₽")
         except Exception:
             await msg.answer("Неверный формат. Введи: <code>USD RUB</code>\nНапример: <code>5.99 590</code>")
+        return
+
+    # ===== НОВОЕ: обработка вставленных URI/подписок =====
+    if mode == "add_server_wait":
+        text = (msg.text or "").strip()
+        if not text:
+            await msg.answer("Пусто. Вставьте строки с URI или ссылку на подписку.")
+            return
+
+        lines: List[str] = []
+        # Разберём, мог админ прислать ссылку на подписку
+        possible_urls = [ln for ln in text.split() if ln.lower().startswith(("http://","https://"))]
+        try:
+            for u in possible_urls:
+                r = requests.get(u, timeout=20)
+                r.raise_for_status()
+                lines.extend(_split_lines_from_subscription(r.content))
+        except Exception as e:
+            await msg.answer(f"Не удалось загрузить подписку: {e}")
+
+        # Плюс вручную вставленные строки с протоколами
+        for ln in text.split():
+            if "://" in ln and not ln.lower().startswith(("http://","https://")):
+                lines.append(ln.strip())
+
+        if not lines:
+            await msg.answer("Не нашёл ни одного узла в сообщении. Проверь форматы.")
+            return
+
+        added = 0
+        for line in lines:
+            low = line.lower()
+            try:
+                if low.startswith("vmess://"):
+                    d = _parse_vmess(line)
+                    if not d: continue
+                    tag = d.get("tag","VMess")
+                    if XUI_TAG_PREFIX: d["tag"] = f"{XUI_TAG_PREFIX.strip()} {tag}"
+                    if _upsert_server("vmess", d["tag"], d): added += 1
+                elif low.startswith("vless://") or low.startswith("trojan://"):
+                    d = _parse_vless_or_trojan(line)
+                    if not d: continue
+                    proto = "vless" if low.startswith("vless://") else "trojan"
+                    tag = d.get("tag", proto.upper())
+                    if XUI_TAG_PREFIX: d["tag"] = f"{XUI_TAG_PREFIX.strip()} {tag}"
+                    if _upsert_server(proto, d["tag"], d): added += 1
+                # остальные строки игнорируем
+            except Exception:
+                continue
+
+        # Привязываем все доступные сервера ко всем пользователям
+        assign_all_servers_to_everyone()
+
+        ADMIN_SESSIONS.pop(msg.from_user.id, None)
+        await msg.answer(f"Импорт завершён. Добавлено/обновлено узлов: {added}")
         return
 
 # ===================== DEMO SERVERS =====================

@@ -140,9 +140,7 @@ def ensure_default_plans():
         for code, days, usd, rub in defaults:
             p = db.query(Plan).filter_by(code=code).one_or_none()
             if not p:
-                db.add(Plan(code=code),)
-                p = db.query(Plan).filter_by(code=code).one()
-                p.days = days; p.usd_price = usd; p.rub_price = rub
+                db.add(Plan(code=code, days=days, usd_price=usd, rub_price=rub))
         db.commit()
     finally:
         db.close()
@@ -224,8 +222,17 @@ def assign_all_servers_to_user(user: User):
     finally:
         db.close()
 
+def unassign_all_servers_from_everyone():
+    """Удалить все привязки серверов у всех пользователей."""
+    db = SessionLocal()
+    try:
+        db.query(UserServer).delete()
+        db.commit()
+    finally:
+        db.close()
+
 def assign_all_servers_to_everyone():
-    """После добавления новых серверов привязываем их ко всем пользователям."""
+    """Привязываем все включённые сервера ко всем пользователям."""
     db = SessionLocal()
     try:
         users = db.query(User).all()
@@ -456,8 +463,7 @@ def gate_kb() -> InlineKeyboardMarkup:
 @dp.message(CommandStart())
 async def start(msg: Message):
     user = get_or_create_user(msg.from_user.id)
-    # Привязываем все текущие сервера к НОВОМУ (или существующему) пользователю:
-    assign_all_servers_to_user(user)
+    # ВАЖНО: больше не привязываем сервера автоматически → по умолчанию подписка пустая
     ok_sub = await check_membership(msg.from_user.id)
     if not ok_sub or not user.accepted_terms:
         text = ("<b>Добро пожаловать!</b>\n\n"
@@ -505,7 +511,7 @@ async def cb_profile(c: CallbackQuery):
              f"Баланс: <b>{user.balance:.2f}</b>\n"
              f"Подписка до: <b>{user.subscription_expires_at or '—'}</b> (осталось: {left})\n\n"
              f"🔗 <b>Ваша подписка:</b>\n<code>{sub_url}</code>\n"
-             "Содержит все назначенные серверы (multi-server). Если срок истёк — ответ пустой." )
+             "Содержит все <i>назначенные</i> вам включённые серверы. Если срок истёк — ответ пустой." )
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="back")]])
     await c.message.edit_text(text, reply_markup=kb); await c.answer()
 
@@ -728,6 +734,43 @@ async def cb_topup_yk(c: CallbackQuery):
         await c.message.answer(f"Ошибка ЮKassa: {e}")
 
 # ===================== АДМИН-ПАНЕЛЬ =====================
+def servers_menu_kb(page: int = 0, page_size: int = 6) -> InlineKeyboardMarkup:
+    db = SessionLocal()
+    try:
+        all_srv = db.query(Server).order_by(Server.id.desc()).all()
+    finally:
+        db.close()
+    start = page * page_size
+    chunk = all_srv[start:start+page_size]
+    rows = []
+    for s in chunk:
+        state = "🟢" if s.enabled else "⚪️"
+        rows.append([
+            InlineKeyboardButton(text=f"{state} {s.name}", callback_data=f"adm_srv_view_{s.id}")
+        ])
+    nav = []
+    if start > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm_srv_page_{page-1}"))
+    if start + page_size < len(all_srv):
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"adm_srv_page_{page+1}"))
+    footer = [
+        [InlineKeyboardButton(text="➕ Импорт (URI/подписка)", callback_data="adm_add_server")],
+        [InlineKeyboardButton(text="✅ Назначить ВСЕМ", callback_data="adm_srv_assign_all"),
+         InlineKeyboardButton(text="🧹 Отвязать у ВСЕХ", callback_data="adm_srv_unassign_all")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="admin")]
+    ]
+    if nav:
+        rows.append(nav)
+    rows.extend(footer)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def server_actions_kb(sid: int, page: int = 0) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔁 Вкл/Выкл", callback_data=f"adm_srv_toggle_{sid}_{page}")],
+        [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"adm_srv_del_{sid}_{page}")],
+        [InlineKeyboardButton(text="◀️ К списку", callback_data=f"adm_srv_page_{page}")]
+    ])
+
 @dp.callback_query(F.data == "admin")
 async def cb_admin(c: CallbackQuery):
     if not is_admin(c.from_user.id):
@@ -737,12 +780,85 @@ async def cb_admin(c: CallbackQuery):
         [InlineKeyboardButton(text="➕ Пополнить баланс (TG ID)", callback_data="adm_addbal")],
         [InlineKeyboardButton(text="👑 Назначить админа", callback_data="adm_setadmin")],
         [InlineKeyboardButton(text="💲 Изменить цены (30/90/270)", callback_data="adm_prices")],
-        [InlineKeyboardButton(text="➕ Добавить сервер (URI/подписка)", callback_data="adm_add_server")],
+        [InlineKeyboardButton(text="🧩 Серверы", callback_data="adm_srv_menu")],
         [InlineKeyboardButton(text="🔄 Синхронизировать 3x-ui", callback_data="adm_sync_xui")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
     ])
     await c.message.edit_text("🛠 Админ-панель", reply_markup=kb); await c.answer()
 
+@dp.callback_query(F.data == "adm_srv_menu")
+async def cb_adm_srv_menu(c: CallbackQuery):
+    if not is_admin(c.from_user.id): return
+    await c.message.edit_text("🧩 Серверы:", reply_markup=servers_menu_kb(page=0)); await c.answer()
+
+@dp.callback_query(F.data.startswith("adm_srv_page_"))
+async def cb_adm_srv_page(c: CallbackQuery):
+    if not is_admin(c.from_user.id): return
+    page = int(c.data.split("_")[-1])
+    await c.message.edit_text("🧩 Серверы:", reply_markup=servers_menu_kb(page=page)); await c.answer()
+
+@dp.callback_query(F.data.startswith("adm_srv_view_"))
+async def cb_adm_srv_view(c: CallbackQuery):
+    if not is_admin(c.from_user.id): return
+    sid = int(c.data.split("_")[-1])
+    db = SessionLocal()
+    try:
+        s = db.query(Server).filter_by(id=sid).one()
+        data = json.loads(s.json_data)
+        text = (f"<b>{s.name}</b>\n"
+                f"Протокол: <code>{s.protocol}</code>\n"
+                f"Статус: <b>{'Включён' if s.enabled else 'Выключен'}</b>\n\n"
+                f"<code>{json.dumps(data, ensure_ascii=False, indent=2)}</code>")
+    finally:
+        db.close()
+    await c.message.edit_text(text, reply_markup=server_actions_kb(sid)); await c.answer()
+
+@dp.callback_query(F.data.startswith("adm_srv_toggle_"))
+async def cb_adm_srv_toggle(c: CallbackQuery):
+    if not is_admin(c.from_user.id): return
+    _, _, _, sid, page = c.data.split("_")
+    sid = int(sid); page = int(page)
+    db = SessionLocal()
+    try:
+        s = db.query(Server).filter_by(id=sid).one()
+        s.enabled = not s.enabled
+        db.commit()
+    finally:
+        db.close()
+    await c.answer("Готово.")
+    await cb_adm_srv_page(type("obj", (), {"from_user": c.from_user, "data": f"adm_srv_page_{page}", "message": c.message, "answer": c.answer}) )
+
+@dp.callback_query(F.data.startswith("adm_srv_del_"))
+async def cb_adm_srv_del(c: CallbackQuery):
+    if not is_admin(c.from_user.id): return
+    _, _, _, sid, page = c.data.split("_")
+    sid = int(sid); page = int(page)
+    db = SessionLocal()
+    try:
+        s = db.query(Server).filter_by(id=sid).one_or_none()
+        if s:
+            db.delete(s)  # каскадом удалит привязки UserServer
+            db.commit()
+    finally:
+        db.close()
+    await c.answer("Удалено.")
+    await cb_adm_srv_page(type("obj", (), {"from_user": c.from_user, "data": f"adm_srv_page_{page}", "message": c.message, "answer": c.answer}) )
+
+@dp.callback_query(F.data == "adm_srv_assign_all")
+async def cb_adm_srv_assign_all(c: CallbackQuery):
+    if not is_admin(c.from_user.id): return
+    assign_all_servers_to_everyone()
+    await c.answer("Назначено всем.")
+    await cb_adm_srv_menu(c)
+
+@dp.callback_query(F.data == "adm_srv_unassign_all")
+async def cb_adm_srv_unassign_all(c: CallbackQuery):
+    if not is_admin(c.from_user.id): return
+    unassign_all_servers_from_everyone()
+    await c.answer("Все привязки удалены.")
+    await cb_adm_srv_menu(c)
+
+# ---- рассылка/баланс/цены (как было) ----
 @dp.callback_query(F.data == "adm_broadcast")
 async def cb_adm_broadcast(c: CallbackQuery):
     if not is_admin(c.from_user.id): return
@@ -790,26 +906,8 @@ async def cb_adm_sync_xui(c: CallbackQuery):
         await c.answer("XUI_SUB_URLS не задан в .env", show_alert=True); return
     await c.answer("Синхронизация…")
     total = sync_from_xui_subscriptions()
-    assign_all_servers_to_everyone()
-    await c.message.answer(f"Готово. Обновлено узлов: {total}\nИсточник(и): {', '.join(XUI_SUB_URLS)}")
-
-# ========= добавление серверов (URI/подписка) через админ-панель =========
-@dp.callback_query(F.data == "adm_add_server")
-async def cb_adm_add_server(c: CallbackQuery):
-    if not is_admin(c.from_user.id): 
-        await c.answer("Нет доступа", show_alert=True); 
-        return
-    ADMIN_SESSIONS[c.from_user.id] = {"mode": "add_server_wait"}
-    text = (
-        "Вставьте одной или несколькими строками:\n"
-        "• <code>vless://…</code>\n• <code>vmess://…</code>\n• <code>trojan://…</code>\n"
-        "или ссылку на подписку <code>http(s)://…</code> (бот скачает и распарсит).\n\n"
-        "После импорта узлы автоматически попадут ко всем пользователям."
-    )
-    await c.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="admin")]
-    ]))
-    await c.answer()
+    await c.message.answer(f"Готово. Обновлено/обновлено узлов: {total}\nИсточник(и): {', '.join(XUI_SUB_URLS)}\n"
+                           "Не забудьте назначить узлы пользователям: «🧩 Серверы → ✅ Назначить ВСЕМ»")
 
 @dp.message()
 async def admin_text_router(msg: Message):
@@ -876,7 +974,7 @@ async def admin_text_router(msg: Message):
             await msg.answer("Неверный формат. Введи: <code>USD RUB</code>\nНапример: <code>5.99 590</code>")
         return
 
-    # ===== обработка вставленных URI/подписок =====
+    # ===== добавление серверов (URI/подписки) =====
     if mode == "add_server_wait":
         text = (msg.text or "").strip()
         if not text:
@@ -884,7 +982,6 @@ async def admin_text_router(msg: Message):
             return
 
         lines: List[str] = []
-        # загрузка подписок по http(s)
         possible_urls = [ln for ln in text.split() if ln.lower().startswith(("http://","https://"))]
         try:
             for u in possible_urls:
@@ -894,7 +991,6 @@ async def admin_text_router(msg: Message):
         except Exception as e:
             await msg.answer(f"Не удалось загрузить подписку: {e}")
 
-        # вручную вставленные vless/vmess/trojan
         for ln in text.split():
             if "://" in ln and not ln.lower().startswith(("http://","https://")):
                 lines.append(ln.strip())
@@ -923,16 +1019,31 @@ async def admin_text_router(msg: Message):
             except Exception:
                 continue
 
-        # Привязываем все доступные сервера ко всем пользователям (вот тут "интеграция")
-        assign_all_servers_to_everyone()
-
         ADMIN_SESSIONS.pop(msg.from_user.id, None)
-        await msg.answer(f"Импорт завершён. Добавлено/обновлено узлов: {added}")
+        await msg.answer(f"Импорт завершён. Добавлено/обновлено узлов: {added}\n"
+                         "Чтобы пользователи их получили, зайди: 🧩 Серверы → ✅ Назначить ВСЕМ.")
         return
+
+@dp.callback_query(F.data == "adm_add_server")
+async def cb_adm_add_server(c: CallbackQuery):
+    if not is_admin(c.from_user.id): 
+        await c.answer("Нет доступа", show_alert=True); 
+        return
+    ADMIN_SESSIONS[c.from_user.id] = {"mode": "add_server_wait"}
+    text = (
+        "Вставьте одной или несколькими строками:\n"
+        "• <code>vless://…</code>\n• <code>vmess://…</code>\n• <code>trojan://…</code>\n"
+        "или ссылку на подписку <code>http(s)://…</code> (бот скачает и распарсит).\n\n"
+        "После импорта нажмите «✅ Назначить ВСЕМ», чтобы узлы появились у клиентов."
+    )
+    await c.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="adm_srv_menu")]
+    ]))
+    await c.answer()
 
 # ===================== NO DEMO SEED =====================
 def seed_servers_if_empty():
-    """Ничего не создаём — изначально пусто, пока админ не добавит узлы."""
+    """Ничего не создаём — изначально пусто."""
     return
 
 # ===================== ENTRY =====================

@@ -140,7 +140,9 @@ def ensure_default_plans():
         for code, days, usd, rub in defaults:
             p = db.query(Plan).filter_by(code=code).one_or_none()
             if not p:
-                db.add(Plan(code=code, days=days, usd_price=usd, rub_price=rub))
+                db.add(Plan(code=code),)
+                p = db.query(Plan).filter_by(code=code).one()
+                p.days = days; p.usd_price = usd; p.rub_price = rub
         db.commit()
     finally:
         db.close()
@@ -211,6 +213,7 @@ def extend_subscription_days(user_id: int, days: int):
         db.close()
 
 def assign_all_servers_to_user(user: User):
+    """Привязать все включённые серверы к конкретному пользователю."""
     db = SessionLocal()
     try:
         current = {us.server_id for us in db.query(UserServer).filter_by(user_id=user.id).all()}
@@ -453,6 +456,7 @@ def gate_kb() -> InlineKeyboardMarkup:
 @dp.message(CommandStart())
 async def start(msg: Message):
     user = get_or_create_user(msg.from_user.id)
+    # Привязываем все текущие сервера к НОВОМУ (или существующему) пользователю:
     assign_all_servers_to_user(user)
     ok_sub = await check_membership(msg.from_user.id)
     if not ok_sub or not user.accepted_terms:
@@ -789,7 +793,7 @@ async def cb_adm_sync_xui(c: CallbackQuery):
     assign_all_servers_to_everyone()
     await c.message.answer(f"Готово. Обновлено узлов: {total}\nИсточник(и): {', '.join(XUI_SUB_URLS)}")
 
-# ========= НОВОЕ: добавление серверов (URI/подписка) через админ-панель =========
+# ========= добавление серверов (URI/подписка) через админ-панель =========
 @dp.callback_query(F.data == "adm_add_server")
 async def cb_adm_add_server(c: CallbackQuery):
     if not is_admin(c.from_user.id): 
@@ -800,7 +804,7 @@ async def cb_adm_add_server(c: CallbackQuery):
         "Вставьте одной или несколькими строками:\n"
         "• <code>vless://…</code>\n• <code>vmess://…</code>\n• <code>trojan://…</code>\n"
         "или ссылку на подписку <code>http(s)://…</code> (бот скачает и распарсит).\n\n"
-        "После импорта узлы автоматически попадут к всем пользователям."
+        "После импорта узлы автоматически попадут ко всем пользователям."
     )
     await c.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="◀️ Назад", callback_data="admin")]
@@ -872,7 +876,7 @@ async def admin_text_router(msg: Message):
             await msg.answer("Неверный формат. Введи: <code>USD RUB</code>\nНапример: <code>5.99 590</code>")
         return
 
-    # ===== НОВОЕ: обработка вставленных URI/подписок =====
+    # ===== обработка вставленных URI/подписок =====
     if mode == "add_server_wait":
         text = (msg.text or "").strip()
         if not text:
@@ -880,7 +884,7 @@ async def admin_text_router(msg: Message):
             return
 
         lines: List[str] = []
-        # Разберём, мог админ прислать ссылку на подписку
+        # загрузка подписок по http(s)
         possible_urls = [ln for ln in text.split() if ln.lower().startswith(("http://","https://"))]
         try:
             for u in possible_urls:
@@ -890,7 +894,7 @@ async def admin_text_router(msg: Message):
         except Exception as e:
             await msg.answer(f"Не удалось загрузить подписку: {e}")
 
-        # Плюс вручную вставленные строки с протоколами
+        # вручную вставленные vless/vmess/trojan
         for ln in text.split():
             if "://" in ln and not ln.lower().startswith(("http://","https://")):
                 lines.append(ln.strip())
@@ -916,68 +920,20 @@ async def admin_text_router(msg: Message):
                     tag = d.get("tag", proto.upper())
                     if XUI_TAG_PREFIX: d["tag"] = f"{XUI_TAG_PREFIX.strip()} {tag}"
                     if _upsert_server(proto, d["tag"], d): added += 1
-                # остальные строки игнорируем
             except Exception:
                 continue
 
-        # Привязываем все доступные сервера ко всем пользователям
+        # Привязываем все доступные сервера ко всем пользователям (вот тут "интеграция")
         assign_all_servers_to_everyone()
 
         ADMIN_SESSIONS.pop(msg.from_user.id, None)
         await msg.answer(f"Импорт завершён. Добавлено/обновлено узлов: {added}")
         return
 
-# ===================== DEMO SERVERS =====================
+# ===================== NO DEMO SEED =====================
 def seed_servers_if_empty():
-    db = SessionLocal()
-    try:
-        if db.query(Server).count() == 0:
-            demo = [
-                Server(
-                    name="🇩🇪 DE-1 (TLS/WS)",
-                    protocol="vless",
-                    json_data=json.dumps({
-                        "uuid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-                        "host": "de1.example.com",
-                        "port": 443,
-                        "security": "tls",
-                        "sni": "de1.example.com",
-                        "type": "ws",
-                        "path": "/ws-de",
-                        "tag": "DE-1"
-                    })
-                ),
-                Server(
-                    name="🇳🇱 NL-2 (VMess)",
-                    protocol="vmess",
-                    json_data=json.dumps({
-                        "uuid": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
-                        "host": "nl2.example.com",
-                        "port": 443,
-                        "security": "tls",
-                        "sni": "nl2.example.com",
-                        "type": "ws",
-                        "path": "/vmess",
-                        "tag": "NL-2"
-                    })
-                ),
-                Server(
-                    name="🇸🇬 SG-1 (Trojan)",
-                    protocol="trojan",
-                    json_data=json.dumps({
-                        "password": "trojan-password-123",
-                        "host": "sg1.example.com",
-                        "port": 443,
-                        "sni": "sg1.example.com",
-                        "type": "ws",
-                        "path": "/trojan",
-                        "tag": "SG-1"
-                    })
-                )
-            ]
-            db.add_all(demo); db.commit()
-    finally:
-        db.close()
+    """Ничего не создаём — изначально пусто, пока админ не добавит узлы."""
+    return
 
 # ===================== ENTRY =====================
 if __name__ == "__main__":

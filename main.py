@@ -140,7 +140,9 @@ def ensure_default_plans():
         for code, days, usd, rub in defaults:
             p = db.query(Plan).filter_by(code=code).one_or_none()
             if not p:
-                db.add(Plan(code=code, days=days, usd_price=usd, rub_price=rub))
+                db.add(Plan(code=code),)
+                p = db.query(Plan).filter_by(code=code).one()
+                p.days = days; p.usd_price = usd; p.rub_price = rub
         db.commit()
     finally:
         db.close()
@@ -211,7 +213,6 @@ def extend_subscription_days(user_id: int, days: int):
         db.close()
 
 def assign_all_servers_to_user(user: User):
-    """Привязать все включённые серверы к конкретному пользователю."""
     db = SessionLocal()
     try:
         current = {us.server_id for us in db.query(UserServer).filter_by(user_id=user.id).all()}
@@ -223,7 +224,6 @@ def assign_all_servers_to_user(user: User):
         db.close()
 
 def unassign_all_servers_from_everyone():
-    """Удалить все привязки серверов у всех пользователей."""
     db = SessionLocal()
     try:
         db.query(UserServer).delete()
@@ -232,7 +232,6 @@ def unassign_all_servers_from_everyone():
         db.close()
 
 def assign_all_servers_to_everyone():
-    """Привязываем все включённые сервера ко всем пользователям."""
     db = SessionLocal()
     try:
         users = db.query(User).all()
@@ -246,36 +245,34 @@ def assign_all_servers_to_everyone():
     finally:
         db.close()
 
-# ---- генерация URI по серверным шаблонам (VLESS fix for Happ VPN) ----
+# ---- генерация URI (фиксы для Happ 3.2.1 и v2run) ----
 def build_uri(server: Server) -> str:
     data = json.loads(server.json_data)
     proto = server.protocol.lower()
+
     if proto == "vless":
         uuid = data["uuid"]
         host = data["host"]
         port = data.get("port", 443)
 
-        # обязательные/часто нужные параметры для Xray/Happ
         q = []
-        # encryption=none must be present for vless
+        # важно для Happ/xray: encryption=none
         q.append("encryption=none")
-        # security (tls/reality/none)
-        if "security" in data and data.get("security"):
+        # tls/realty/none — добавляем только если есть
+        if data.get("security"):
             q.append(f"security={data['security']}")
-        # sni
         if data.get("sni"):
             q.append(f"sni={data['sni']}")
-        # type/path
         if data.get("type"):
             q.append(f"type={data['type']}")
         if data.get("path"):
             q.append(f"path={data['path']}")
-        # host header for WS/HTTP/HTTP2 (если есть отдельное поле host_header, иначе используем sni)
+        # host header (WS)
         if data.get("host_header"):
             q.append(f"host={data['host_header']}")
         elif data.get("sni"):
             q.append(f"host={data['sni']}")
-        # доп. поля, если заданы
+        # доп параметры, если присутствуют
         if data.get("fp"):
             q.append(f"fp={data['fp']}")
         if data.get("alpn"):
@@ -288,6 +285,8 @@ def build_uri(server: Server) -> str:
         return f"vless://{uuid}@{host}:{port}?{query}#{tag}"
 
     if proto == "vmess":
+        # формируем корректный JSON без удаления padding (=) в base64
+        use_tls = (data.get("security", "").lower() == "tls")
         vmess_obj = {
             "v": "2",
             "ps": data.get("tag", server.name),
@@ -295,15 +294,21 @@ def build_uri(server: Server) -> str:
             "port": str(data.get("port", 443)),
             "id": data["uuid"],
             "aid": "0",
+            "scy": "none",
             "net": data.get("type", "ws"),
             "type": "none",
-            "host": data.get("sni", ""),
+            "host": data.get("host_header", data.get("sni", "")),
             "path": data.get("path", "/"),
-            "tls": data.get("security", "tls"),
+            "tls": "tls" if use_tls else "",
         }
+        # расширенные поля (поддерживаются многими клиентами)
+        if data.get("sni"):  vmess_obj["sni"]  = data["sni"]
+        if data.get("alpn"): vmess_obj["alpn"] = data["alpn"]
+        if data.get("fp"):   vmess_obj["fp"]   = data["fp"]
+
         raw = json.dumps(vmess_obj, ensure_ascii=False)
-        # стандартный base64 (не urlsafe) — лучше совместимость
-        return "vmess://" + base64.b64encode(raw.encode()).decode().strip("=")
+        # ВНИМАНИЕ: не трогаем '=' padding — некоторые клиенты без него падают
+        return "vmess://" + base64.b64encode(raw.encode()).decode()
 
     if proto == "trojan":
         pw = data["password"]; host=data["host"]; port=data.get("port",443)
@@ -311,15 +316,14 @@ def build_uri(server: Server) -> str:
         if data.get("sni"): q.append(f"sni={data['sni']}")
         if data.get("type"): q.append(f"type={data['type']}")
         if data.get("path"): q.append(f"path={data['path']}")
-        # доп параметры — чтобы не потерять
         if data.get("alpn"): q.append(f"alpn={data['alpn']}")
         if data.get("fp"): q.append(f"fp={data['fp']}")
         query="&".join(q); tag=data.get("tag", server.name)
         return f"trojan://{pw}@{host}:{port}?{query}#{tag}"
+
     raise ValueError("Unknown protocol")
 
 def build_subscription_text(user: User) -> str:
-    # пусто, если срок истёк
     if not user.subscription_expires_at or user.subscription_expires_at < datetime.utcnow():
         return ""
     db = SessionLocal()
@@ -338,10 +342,9 @@ def build_subscription_text(user: User) -> str:
 # ===================== FASTAPI: подписка =====================
 api = FastAPI(title="VPN Subscription API")
 
-# детектор VPN-клиента по User-Agent (браузеры отсекаем)
 _VPN_TOKENS = [
-    "okhttp", "v2ray", "xray", "sing-box", "clash", "shadowrocket",
-    "nekoray", "hiddify", "quantumult", "happ", "loon"
+    "okhttp","v2ray","xray","sing-box","clash","shadowrocket",
+    "nekoray","hiddify","quantumult","happ","loon"
 ]
 
 def is_vpn_client(ua: str) -> bool:
@@ -350,7 +353,6 @@ def is_vpn_client(ua: str) -> bool:
 
 @api.get("/s/{token}", response_class=PlainTextResponse)
 def subscription(token: str, request: Request):
-    # 1) токен
     db = SessionLocal()
     try:
         user = db.query(User).filter_by(sub_token=token).one_or_none()
@@ -360,23 +362,20 @@ def subscription(token: str, request: Request):
     finally:
         db.close()
 
-    # 2) если пусто (нет подписки/истекла) — 404, чтобы в браузере тоже ничего не светилось
     if not content.strip():
         return Response(status_code=404)
 
-    # 3) браузерам прячем: отдаём 404 (по желанию — можно текст с инструкцией)
     ua = request.headers.get("user-agent", "")
     raw_param = request.query_params.get("raw")
     if not is_vpn_client(ua) and raw_param not in ("1", "true", "yes"):
         return Response(status_code=404)
 
-    # 4) по умолчанию для клиентов — BASE64, но если ?raw=1 — отдать текст
     if raw_param in ("1", "true", "yes"):
         return PlainTextResponse(content, media_type="text/plain; charset=utf-8")
     b64 = base64.b64encode(content.encode()).decode()
     return PlainTextResponse(b64, media_type="text/plain; charset=utf-8")
 
-# ===================== XUI SYNC / PARSERS (опционально) =====================
+# ===================== XUI SYNC / PARSERS =====================
 def _upsert_server(proto: str, name: str, data: dict) -> bool:
     db = SessionLocal()
     try:
@@ -403,17 +402,20 @@ def _upsert_server(proto: str, name: str, data: dict) -> bool:
 def _parse_vmess(uri: str) -> Optional[dict]:
     try:
         b64 = uri[len("vmess://"):]
-        pad = '=' * ((4 - len(b64) % 4) % 4)
-        payload = base64.b64decode((b64 + pad).encode()).decode()
-        obj = json.loads(payload)
+        # не отрезаем '=', decodер сам разберётся по padding
+        payload = base64.b64decode(b64 + "===")  # безопасная подкладка
+        obj = json.loads(payload.decode())
         return {
             "uuid": obj.get("id"),
             "host": obj.get("add"),
             "port": int(obj.get("port", 443)),
             "security": "tls" if obj.get("tls","") in ("tls","reality") else "",
-            "sni": obj.get("host",""),
+            "sni": obj.get("sni", obj.get("host","")),
             "type": obj.get("net","ws"),
             "path": obj.get("path","/"),
+            "host_header": obj.get("host",""),
+            "alpn": (",".join(obj["alpn"]) if isinstance(obj.get("alpn"), list) else obj.get("alpn","")),
+            "fp": obj.get("fp",""),
             "tag": obj.get("ps","VMess")
         }
     except Exception:
@@ -434,20 +436,16 @@ def _parse_vless_or_trojan(uri: str) -> Optional[dict]:
         data = {
             "host": host,
             "port": int(port or 443),
-            # security: tls/reality/none — не трогаем, что пришло
             "security": q.get("security", [""])[0],
             "sni": q.get("sni", [""])[0],
             "type": q.get("type", ["ws"])[0],
             "path": q.get("path", ["/"])[0],
-            # host header (если был в ссылке)
             "host_header": q.get("host", [""])[0],
-            # дополнительные поля
             "fp": q.get("fp", [""])[0],
             "alpn": q.get("alpn", [""])[0],
             "flow": q.get("flow", [""])[0],
             "tag": unquote(parsed.fragment) if parsed.fragment else (scheme.upper())
         }
-        # encryption: для vless должен быть none — если отсутствует, оставим пусто, но build_uri добавит
         enc = q.get("encryption", [""])[0]
         if enc:
             data["encryption"] = enc
@@ -544,7 +542,6 @@ def gate_kb() -> InlineKeyboardMarkup:
 @dp.message(CommandStart())
 async def start(msg: Message):
     user = get_or_create_user(msg.from_user.id)
-    # не привязываем серверы автоматически
     ok_sub = await check_membership(msg.from_user.id)
     if not ok_sub or not user.accepted_terms:
         text = ("<b>Добро пожаловать!</b>\n\n"
@@ -601,9 +598,9 @@ async def cb_keys(c: CallbackQuery):
     user = get_or_create_user(c.from_user.id)
     sub_url = f"{BASE_URL}/s/{user.sub_token}"
     await c.message.edit_text(
-        "Импортируйте ссылку в V2RayN/V2RayNG/Shadowrocket/NekoRay:\n"
+        "Импортируйте ссылку в V2RayN/V2RayNG/Shadowrocket/Happ/NekoRay:\n"
         f"<code>{sub_url}</code>\n\n"
-        "Если приложение не видит узлы, добавьте <code>?raw=1</code> в конец ссылки для текстового формата.",
+        "Если приложение не видит узлы, добавьте <code>?raw=1</code> к ссылке (текстовый формат).",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="back")]])
     ); await c.answer()
 
@@ -621,7 +618,7 @@ async def cb_about(c: CallbackQuery):
 async def cb_how(c: CallbackQuery):
     await c.message.edit_text(
         "1) Установите V2RayNG / V2RayN / Shadowrocket / Happ VPN\n"
-        "2) Вставьте ссылку-подписку из профиля\n"
+        "2) Вставьте ссылку-подписку\n"
         "3) Обновите список узлов и подключайтесь.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="back")]])
     ); await c.answer()
@@ -745,7 +742,7 @@ def check_crypto_status_topups():
 
 @dp.callback_query(F.data == "topup_crypto")
 async def cb_topup_crypto(c: CallbackQuery):
-    amount = 5.00  # пример фиксированного пополнения
+    amount = 5.00
     try:
         url = create_crypto_invoice_topup(amount, c.from_user.id)
         await c.answer()
@@ -806,7 +803,7 @@ def check_yookassa_status_topups():
 
 @dp.callback_query(F.data == "topup_yk")
 async def cb_topup_yk(c: CallbackQuery):
-    amount_rub = 500  # пример фиксированного пополнения
+    amount_rub = 500
     try:
         url = create_yookassa_payment_topup(amount_rub, c.from_user.id)
         await c.answer()
@@ -815,7 +812,7 @@ async def cb_topup_yk(c: CallbackQuery):
     except Exception as e:
         await c.message.answer(f"Ошибка ЮKassa: {e}")
 
-# ===================== АДМИН-ПАНЕЛЬ (ваша логика без изменений) =====================
+# ===================== АДМИН-ПАНЕЛЬ (как было) =====================
 def servers_menu_kb(page: int = 0, page_size: int = 6) -> InlineKeyboardMarkup:
     db = SessionLocal()
     try:
@@ -827,9 +824,7 @@ def servers_menu_kb(page: int = 0, page_size: int = 6) -> InlineKeyboardMarkup:
     rows = []
     for s in chunk:
         state = "🟢" if s.enabled else "⚪️"
-        rows.append([
-            InlineKeyboardButton(text=f"{state} {s.name}", callback_data=f"adm_srv_view_{s.id}")
-        ])
+        rows.append([InlineKeyboardButton(text=f"{state} {s.name}", callback_data=f"adm_srv_view_{s.id}")])
     nav = []
     if start > 0:
         nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm_srv_page_{page-1}"))
@@ -919,7 +914,7 @@ async def cb_adm_srv_del(c: CallbackQuery):
     try:
         s = db.query(Server).filter_by(id=sid).one_or_none()
         if s:
-            db.delete(s)  # каскадом удалит привязки UserServer
+            db.delete(s)
             db.commit()
     finally:
         db.close()
@@ -972,7 +967,7 @@ async def cb_adm_prices(c: CallbackQuery):
 @dp.callback_query(F.data.in_({"adm_price_30d","adm_price_90d","adm_price_270d"}))
 async def cb_adm_price_edit(c: CallbackQuery):
     if not is_admin(c.from_user.id): return
-    plan_code = c.data.split("_")[2]  # 30d|90d|270d
+    plan_code = c.data.split("_")[2]
     ADMIN_SESSIONS[c.from_user.id] = {"mode": "price_wait", "plan": plan_code}
     await c.message.edit_text(
         f"Введи новые цены для <b>{plan_code}</b> в формате:\n"
@@ -1055,7 +1050,6 @@ async def admin_text_router(msg: Message):
             await msg.answer("Неверный формат. Введи: <code>USD RUB</code>\nНапример: <code>5.99 590</code>")
         return
 
-    # ===== добавление серверов (URI/подписки) =====
     if mode == "add_server_wait":
         text = (msg.text or "").strip()
         if not text:
@@ -1107,7 +1101,7 @@ async def admin_text_router(msg: Message):
 
 @dp.callback_query(F.data == "adm_add_server")
 async def cb_adm_add_server(c: CallbackQuery):
-    if not is_admin(c.from_user.id): 
+    if not is_admin(c.from_user.id):
         await c.answer("Нет доступа", show_alert=True); 
         return
     ADMIN_SESSIONS[c.from_user.id] = {"mode": "add_server_wait"}
@@ -1124,7 +1118,6 @@ async def cb_adm_add_server(c: CallbackQuery):
 
 # ===================== NO DEMO SEED =====================
 def seed_servers_if_empty():
-    """Ничего не создаём — изначально пусто."""
     return
 
 # ===================== ENTRY =====================

@@ -7,8 +7,8 @@ from typing import List, Optional, Dict
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import Response, PlainTextResponse
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (Message, CallbackQuery, InlineKeyboardMarkup,
@@ -253,6 +253,8 @@ def build_uri(server: Server) -> str:
     if proto == "vless":
         uuid = data["uuid"]; host = data["host"]; port = data.get("port", 443)
         q = []
+        # ВАЖНО: для VLESS на новых Xray требуется encryption=none
+        q.append("encryption=none")
         if data.get("security", "tls"): q.append(f"security={data.get('security','tls')}")
         if data.get("sni"): q.append(f"sni={data['sni']}")
         if data.get("type"): q.append(f"type={data['type']}")
@@ -297,14 +299,44 @@ def build_subscription_text(user: User) -> str:
 # ===================== FASTAPI: подписка =====================
 api = FastAPI(title="VPN Subscription API")
 
-@api.get("/s/{token}", response_class=PlainTextResponse)
-def subscription(token: str):
+def _build_subscription_bytes(user: User) -> bytes:
+    """Возвращает base64 содержимое подписки (чтобы скрыть URI)."""
+    text = build_subscription_text(user)
+    if not text:
+        return b""
+    return base64.b64encode(text.encode("utf-8"))
+
+@api.get("/s/{token}")
+def subscription(token: str, request: Request):
+    """Отдаём base64-подписку как файл; браузерам — 404, по окончанию срока — пусто/404."""
     db = SessionLocal()
     try:
         user = db.query(User).filter_by(sub_token=token).one_or_none()
         if not user:
             raise HTTPException(status_code=404, detail="Invalid token")
-        return PlainTextResponse(build_subscription_text(user), media_type="text/plain; charset=utf-8")
+
+        ua = (request.headers.get("User-Agent") or "").lower()
+
+        # Истёкший срок → VPN-клиентам пустой файл, браузерам 404 (чтобы ничего не светить)
+        if not user.subscription_expires_at or user.subscription_expires_at < datetime.utcnow():
+            if "mozilla" in ua or "chrome" in ua or "safari" in ua or "edge" in ua:
+                raise HTTPException(status_code=404, detail="Not found")
+            return Response(
+                content=b"",
+                media_type="application/octet-stream",
+                headers={"Content-Disposition": "attachment; filename=sub.txt"}
+            )
+
+        # Браузерам не показываем
+        if "mozilla" in ua or "chrome" in ua or "safari" in ua or "edge" in ua:
+            raise HTTPException(status_code=404, detail="Not found")
+
+        payload = _build_subscription_bytes(user)
+        return Response(
+            content=payload,
+            media_type="application/octet-stream",
+            headers={"Content-Disposition": "attachment; filename=sub.txt"}
+        )
     finally:
         db.close()
 
@@ -365,7 +397,8 @@ def _parse_vless_or_trojan(uri: str) -> Optional[dict]:
         data = {
             "host": host,
             "port": int(port or 443),
-            "security": q.get("security", ["tls"])[0] if 'security' in q else ("tls" if q.get("type", [""])[0] in ("ws","grpc","h2") else ""),
+            # если явно задан security, берём его; иначе оставим пустым — для реальности/без tls
+            "security": q.get("security", [""])[0],
             "sni": q.get("sni", [""])[0],
             "type": q.get("type", ["ws"])[0],
             "path": q.get("path", ["/"])[0],
@@ -463,7 +496,7 @@ def gate_kb() -> InlineKeyboardMarkup:
 @dp.message(CommandStart())
 async def start(msg: Message):
     user = get_or_create_user(msg.from_user.id)
-    # ВАЖНО: больше не привязываем сервера автоматически → по умолчанию подписка пустая
+    # Не назначаем серверы автоматически; админ назначает через интерфейс
     ok_sub = await check_membership(msg.from_user.id)
     if not ok_sub or not user.accepted_terms:
         text = ("<b>Добро пожаловать!</b>\n\n"
@@ -656,6 +689,7 @@ def check_crypto_status_topups():
             if p and p.status != "paid" and status == "paid":
                 p.status = "paid"
                 u = db.query(User).filter_by(id=p.user_id).one()
+                # Зачисляем 1:1 (USDT ~ USD)
                 u.balance += float(p.amount)
         db.commit()
     finally:
@@ -717,6 +751,7 @@ def check_yookassa_status_topups():
             if st == "succeeded":
                 p.status = "paid"
                 u = db.query(User).filter_by(id=p.user_id).one()
+                # Конвертируем RUB -> баланс (USD-экв)
                 u.balance += float(p.amount) / EXCHANGE_RUB_PER_USD
         db.commit()
     finally:
@@ -906,7 +941,7 @@ async def cb_adm_sync_xui(c: CallbackQuery):
         await c.answer("XUI_SUB_URLS не задан в .env", show_alert=True); return
     await c.answer("Синхронизация…")
     total = sync_from_xui_subscriptions()
-    await c.message.answer(f"Готово. Обновлено/обновлено узлов: {total}\nИсточник(и): {', '.join(XUI_SUB_URLS)}\n"
+    await c.message.answer(f"Готово. Обновлено узлов: {total}\nИсточник(и): {', '.join(XUI_SUB_URLS)}\n"
                            "Не забудьте назначить узлы пользователям: «🧩 Серверы → ✅ Назначить ВСЕМ»")
 
 @dp.message()

@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import hmac
+from html import escape as h
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
@@ -13,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.config import settings
 from app.db import SessionLocal
-from app.models import User, Tariff, User as UModel
+from app.models import User, User as UModel
 from app.repositories.users import UserRepository, UserRepository as URepo
 from app.repositories.panels import PanelRepository
 from app.repositories.payments import PaymentRepository
@@ -61,10 +62,12 @@ async def get_uc(session: AsyncSession):
 def sign_uid(uid: str) -> str:
     return hmac.new(settings.SUBSCRIPTION_SIGN_SECRET.encode(), msg=uid.encode(), digestmod=hashlib.sha256).hexdigest()
 
-async def sub_link_for_tg(tg_id: int) -> str:
+async def sub_link_for_tg(tg_id: int) -> tuple[str, str]:
     uid = str(tg_id)
     token = sign_uid(uid)
-    return f"{settings.BASE_PUBLIC_URL}/webhooks/subscription/{uid}?token={token}"
+    sub = f"{settings.BASE_PUBLIC_URL}/webhooks/subscription/{uid}?token={token}"
+    dbg = f"{settings.BASE_PUBLIC_URL}/webhooks/subscription/debug/{uid}?token={token}"
+    return sub, dbg
 
 async def safe_edit(message, text: str, reply_markup=None):
     try:
@@ -83,8 +86,8 @@ async def show_main(user_id: int, chat_id: int, edit_message=None):
     kb = main_menu(is_admin=is_admin)
     text = "🏠 Главное меню"
     if u and u.tos_accepted_at:
-        link = await sub_link_for_tg(user_id)
-        text = f"🏠 Главное меню\n\n👤 Ваша подписка:\n{link}"
+        sub, _ = await sub_link_for_tg(user_id)
+        text = f"🏠 Главное меню\n\n👤 Ваша подписка:\n<code>{h(sub)}</code>"
     if edit_message:
         await safe_edit(edit_message, text, reply_markup=kb)
     else:
@@ -125,12 +128,13 @@ async def tos_accept(c: CallbackQuery):
 
 @dp.callback_query(F.data == "profile")
 async def profile(c: CallbackQuery):
-    link = await sub_link_for_tg(c.from_user.id)
+    sub, dbg = await sub_link_for_tg(c.from_user.id)
     text = (
         "👤 Профиль\n\n"
-        f"🔗 Ваша постоянная ссылка-подписка:\n{link}\n\n"
-        "ℹ️ Если открывается пусто: либо нет активной подписки, либо панели ещё не вернули узлы. "
-        "Можете проверить по /webhooks/subscription/debug/<ваш_id>?token=..."
+        f"🔗 Ваша постоянная ссылка-подписка:\n<code>{h(sub)}</code>\n\n"
+        "ℹ️ При активной подписке здесь вернётся список узлов. "
+        "Если в браузере пусто — либо подписка не активна, либо панели пока не выдают узлы.\n\n"
+        f"🧪 Отладка:\n<code>{h(dbg)}</code>"
     )
     await safe_edit(c.message, text, reply_markup=main_menu(is_admin=c.from_user.id in settings.ADMIN_IDS))
     await c.answer()
@@ -156,7 +160,7 @@ async def topup_cb(c: CallbackQuery):
         u = await users.get_or_create(c.from_user.id, c.from_user.username)
         url, _ = await cbp.start(u.id, settings.PRICE_MONTH*100, "TON")
         await s.commit()
-    await safe_edit(c.message, f"Оплатите по ссылке:\n{url}", reply_markup=main_menu(is_admin=c.from_user.id in settings.ADMIN_IDS))
+    await safe_edit(c.message, f"Оплатите по ссылке:\n<code>{h(url)}</code>", reply_markup=main_menu(is_admin=c.from_user.id in settings.ADMIN_IDS))
     await c.answer()
 
 @dp.callback_query(F.data == "topup_yk")
@@ -166,7 +170,7 @@ async def topup_yk(c: CallbackQuery):
         u = await users.get_or_create(c.from_user.id, c.from_user.username)
         url, _ = await ykp.start(u.id, settings.PRICE_MONTH*100, settings.CURRENCY)
         await s.commit()
-    await safe_edit(c.message, f"Оплатите по ссылке:\n{url}", reply_markup=main_menu(is_admin=c.from_user.id in settings.ADMIN_IDS))
+    await safe_edit(c.message, f"Оплатите по ссылке:\n<code>{h(url)}</code>", reply_markup=main_menu(is_admin=c.from_user.id in settings.ADMIN_IDS))
     await c.answer()
 
 @dp.callback_query(F.data == "tariffs")
@@ -187,7 +191,7 @@ async def buy_tariff(c: CallbackQuery):
         try:
             link, expires = await subs.buy_with_balance_tariff(c.from_user.id, tid, tariffs)
             await s.commit()
-            text = f"✅ Подписка оформлена\n\n🔗 Ссылка:\n{link}\n⏳ Действует до: {expires.date().isoformat()}"
+            text = f"✅ Подписка оформлена\n\n🔗 Ссылка:\n<code>{h(link)}</code>\n⏳ Действует до: {expires.date().isoformat()}"
         except ValueError as e:
             await s.rollback()
             if str(e) == "insufficient_funds":

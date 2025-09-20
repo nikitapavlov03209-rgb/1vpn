@@ -8,7 +8,7 @@ class XUIPanelClient:
         self.username = username
         self.password = password
         self.domain = domain
-        self._client = httpx.AsyncClient(timeout=20.0, follow_redirects=True)
+        self._client = httpx.AsyncClient(timeout=20.0, follow_redirects=True, verify=False)
         self._cookies = None
 
     async def _auth(self):
@@ -24,7 +24,7 @@ class XUIPanelClient:
         await self._ensure()
         payload = {"email": f"{uid}@{self.domain}", "enable": True, "expireTime": int(expire_at.timestamp() * 1000)}
         r = await self._client.post(f"{self.base_url}/panel/api/user/create", json=payload, cookies=self._cookies)
-        if r.status_code == 409 or r.status_code == 400:
+        if r.status_code in (400, 409):
             r = await self._client.post(f"{self.base_url}/panel/api/user/update", json=payload, cookies=self._cookies)
         r.raise_for_status()
         return r.json()

@@ -24,7 +24,6 @@ from app.bot.keyboards import main_menu, accept_tos, topup_menu, admin_menu, can
 from app.bot.states import BroadcastState, AddPanelState, AdminTopupState
 
 bot = Bot(token=settings.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-
 dp = Dispatcher(storage=MemoryStorage())
 
 async def ensure_channel(member_id: int) -> bool:
@@ -67,7 +66,7 @@ async def start(m: Message):
             await s.commit()
             return
         if not u.tos_accepted_at:
-            await m.answer("Перед началом примите пользовательское соглашение", reply_markup=accept_tos(settings.TOS_URL))
+            await m.answer("Перед началом примите пользовательское соглашение", reply_markup=accept_tos(str(settings.TOS_URL)))
             await s.commit()
             return
         await s.commit()

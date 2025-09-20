@@ -1,5 +1,5 @@
 import datetime as dt
-from sqlalchemy import String, Integer, BigInteger, DateTime, Boolean, ForeignKey, Numeric, Text
+from sqlalchemy import String, Integer, BigInteger, DateTime, Boolean, ForeignKey, Text, Numeric
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db import Base
 
@@ -51,4 +51,13 @@ class Broadcast(Base):
     __tablename__ = "broadcasts"
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     text: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+
+class Tariff(Base):
+    __tablename__ = "tariffs"
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    title: Mapped[str] = mapped_column(String(64))
+    days: Mapped[int] = mapped_column(Integer)
+    price_rub: Mapped[int] = mapped_column(Integer)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)

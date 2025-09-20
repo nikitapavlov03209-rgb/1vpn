@@ -13,3 +13,6 @@ class AddPanelState(StatesGroup):
 class AdminTopupState(StatesGroup):
     wait_tg_id = State()
     wait_amount = State()
+
+class AdminPriceState(StatesGroup):
+    wait_price = State()

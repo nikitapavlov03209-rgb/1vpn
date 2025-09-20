@@ -10,18 +10,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.config import settings
 from app.db import SessionLocal
-from app.models import User
+from app.models import User, Tariff
 from app.repositories.users import UserRepository
 from app.repositories.panels import PanelRepository
 from app.repositories.payments import PaymentRepository
 from app.repositories.subscriptions import SubscriptionRepository
+from app.repositories.tariffs import TariffRepository
 from app.services.panels import PanelService
 from app.services.subscriptions import SubscriptionService
 from app.services.payments import CryptoBotProvider, YooKassaProvider
 from app.integrations.cryptobot import CryptoBot
 from app.integrations.yookassa import YooKassaClient
-from app.bot.keyboards import main_menu, accept_tos, topup_menu, admin_menu, cancel_menu
-from app.bot.states import BroadcastState, AddPanelState, AdminTopupState
+from app.bot.keyboards import main_menu, accept_tos, topup_menu, admin_menu, cancel_menu, tariffs_menu, admin_tariffs_menu
+from app.bot.states import BroadcastState, AddPanelState, AdminTopupState, AdminPriceState
+import hashlib, hmac
 
 bot = Bot(token=settings.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
@@ -37,17 +39,17 @@ async def get_uc(session: AsyncSession):
     users = UserRepository(session)
     panels = PanelRepository(session)
     payments = PaymentRepository(session)
+    tariffs = TariffRepository(session)
     pservice = PanelService(panels)
     sservice = SubscriptionService(users, SubscriptionRepository(session), pservice)
     cb = CryptoBot(settings.CRYPTOBOT_TOKEN, settings.CRYPTOBOT_PAYEE)
     yk = YooKassaClient()
     cbp = CryptoBotProvider(payments, cb)
     ykp = YooKassaProvider(payments, yk)
-    return users, sservice, panels, payments, cbp, ykp
+    return users, sservice, panels, payments, cbp, ykp, tariffs
 
 async def sub_link_for_tg(tg_id: int) -> str:
     uid = str(tg_id)
-    import hashlib, hmac
     token = hmac.new(settings.SUBSCRIPTION_SIGN_SECRET.encode(), msg=uid.encode(), digestmod=hashlib.sha256).hexdigest()
     return f"{settings.BASE_PUBLIC_URL}/webhooks/subscription/{uid}?token={token}"
 
@@ -57,10 +59,10 @@ async def show_main(user_id: int, chat_id: int, edit_message=None):
         u = res.scalar_one_or_none()
     is_admin = user_id in settings.ADMIN_IDS
     kb = main_menu(is_admin=is_admin)
-    text = "Главное меню"
+    text = "🏠 Главное меню"
     if u and u.tos_accepted_at:
         link = await sub_link_for_tg(user_id)
-        text = f"Главное меню\n\nВаша подписка:\n{link}"
+        text = f"🏠 Главное меню\n\n👤 Ваша подписка:\n{link}"
     if edit_message:
         await edit_message.edit_text(text, reply_markup=kb)
     else:
@@ -69,7 +71,8 @@ async def show_main(user_id: int, chat_id: int, edit_message=None):
 @dp.message(CommandStart())
 async def start(m: Message):
     async with SessionLocal() as s:
-        users, _, _, _, _, _ = await get_uc(s)
+        users, _, _, _, _, _, tariffs = await get_uc(s)
+        await tariffs.ensure_seed()
         u = await users.get_or_create(m.from_user.id, m.from_user.username)
         if not await ensure_channel(m.from_user.id):
             await m.answer("Для доступа подпишитесь на канал и вернитесь в бот", reply_markup=main_menu(is_admin=m.from_user.id in settings.ADMIN_IDS))
@@ -91,64 +94,78 @@ async def back_to_main(c: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "tos_accept")
 async def tos_accept(c: CallbackQuery):
     async with SessionLocal() as s:
-        users, _, _, _, _, _ = await get_uc(s)
+        users, _, _, _, _, _, _ = await get_uc(s)
         u = await users.get_or_create(c.from_user.id, c.from_user.username)
         await users.set_tos(u)
         await s.commit()
     await show_main(c.from_user.id, c.message.chat.id, edit_message=c.message)
     await c.answer()
 
+@dp.callback_query(F.data == "profile")
+async def profile(c: CallbackQuery):
+    link = await sub_link_for_tg(c.from_user.id)
+    text = f"👤 Профиль\n\n🔗 Ваша постоянная ссылка-подписка:\n{link}\n\nℹ️ Ссылка автоматически включает все ваши активные ключи. После окончания срока подписки ключи перестают работать."
+    await c.message.edit_text(text, reply_markup=main_menu(is_admin=c.from_user.id in settings.ADMIN_IDS))
+    await c.answer()
+
 @dp.callback_query(F.data == "balance")
 async def balance(c: CallbackQuery):
     async with SessionLocal() as s:
-        users, _, _, _, _, _ = await get_uc(s)
+        users, _, _, _, _, _, _ = await get_uc(s)
         u = await users.get_or_create(c.from_user.id, c.from_user.username)
         await s.commit()
-    await c.message.edit_text(f"Баланс: {u.balance/100:.2f} {settings.CURRENCY}", reply_markup=main_menu(is_admin=c.from_user.id in settings.ADMIN_IDS))
+    await c.message.edit_text(f"💳 Баланс: {u.balance/100:.2f} {settings.CURRENCY}", reply_markup=main_menu(is_admin=c.from_user.id in settings.ADMIN_IDS))
     await c.answer()
 
 @dp.callback_query(F.data == "topup")
 async def topup(c: CallbackQuery):
-    await c.message.edit_text("Выберите способ пополнения", reply_markup=topup_menu())
+    await c.message.edit_text("Выберите способ пополнения:", reply_markup=topup_menu())
     await c.answer()
 
 @dp.callback_query(F.data == "topup_cb")
 async def topup_cb(c: CallbackQuery):
     async with SessionLocal() as s:
-        users, _, _, payments, cbp, _ = await get_uc(s)
+        users, _, _, payments, cbp, _, _ = await get_uc(s)
         u = await users.get_or_create(c.from_user.id, c.from_user.username)
         url, pid = await cbp.start(u.id, settings.PRICE_MONTH*100, "TON")
         await s.commit()
-    await c.message.edit_text(f"Оплатите по ссылке: {url}", reply_markup=main_menu(is_admin=c.from_user.id in settings.ADMIN_IDS))
+    await c.message.edit_text(f"Оплатите по ссылке:\n{url}", reply_markup=main_menu(is_admin=c.from_user.id in settings.ADMIN_IDS))
     await c.answer()
 
 @dp.callback_query(F.data == "topup_yk")
 async def topup_yk(c: CallbackQuery):
     async with SessionLocal() as s:
-        users, _, _, payments, _, ykp = await get_uc(s)
+        users, _, _, payments, _, ykp, _ = await get_uc(s)
         u = await users.get_or_create(c.from_user.id, c.from_user.username)
         url, pid = await ykp.start(u.id, settings.PRICE_MONTH*100, settings.CURRENCY)
         await s.commit()
-    await c.message.edit_text(f"Оплатите по ссылке: {url}", reply_markup=main_menu(is_admin=c.from_user.id in settings.ADMIN_IDS))
+    await c.message.edit_text(f"Оплатите по ссылке:\n{url}", reply_markup=main_menu(is_admin=c.from_user.id in settings.ADMIN_IDS))
     await c.answer()
 
-@dp.callback_query(F.data == "buy_sub")
-async def buy_sub(c: CallbackQuery):
+@dp.callback_query(F.data == "tariffs")
+async def tariffs(c: CallbackQuery):
     async with SessionLocal() as s:
-        users, subs, _, _, _, _ = await get_uc(s)
-        try:
-            link, expires = await subs.buy_with_balance(c.from_user.id, settings.DEFAULT_DAYS)
-            await s.commit()
-            await c.message.edit_text(f"Ваша подписка:\n{link}\nАктивна до: {expires.date().isoformat()}", reply_markup=main_menu(is_admin=c.from_user.id in settings.ADMIN_IDS))
-        except ValueError:
-            await s.rollback()
-            await c.message.edit_text("Недостаточно средств. Пополните баланс.", reply_markup=topup_menu())
+        _, _, _, _, _, _, tariffs = await get_uc(s)
+        items_raw = await tariffs.list_active()
+        items = [(t.id, f"🛍 {t.title} • {t.price_rub} ₽") for t in items_raw]
+    await c.message.edit_text("Выберите тариф:", reply_markup=tariffs_menu(items))
     await c.answer()
 
-@dp.callback_query(F.data == "my_sub")
-async def my_sub(c: CallbackQuery):
-    link = await sub_link_for_tg(c.from_user.id)
-    await c.message.edit_text(f"Ваша постоянная ссылка-подписка:\n{link}\nОна автоматически включает ваши активные ключи. При продлении срок действия ключей увеличивается.", reply_markup=main_menu(is_admin=c.from_user.id in settings.ADMIN_IDS))
+@dp.callback_query(F.data.startswith("buy_tariff:"))
+async def buy_tariff(c: CallbackQuery):
+    tid = int(c.data.split(":")[1])
+    async with SessionLocal() as s:
+        users, subs, _, _, _, _, tariffs = await get_uc(s)
+        try:
+            link, expires = await subs.buy_with_balance_tariff(c.from_user.id, tid, tariffs)
+            await s.commit()
+            await c.message.edit_text(f"✅ Подписка оформлена\n\n🔗 Ссылка:\n{link}\n⏳ Действует до: {expires.date().isoformat()}", reply_markup=main_menu(is_admin=c.from_user.id in settings.ADMIN_IDS))
+        except ValueError as e:
+            await s.rollback()
+            if str(e) == "insufficient_funds":
+                await c.message.edit_text("Недостаточно средств. Пополните баланс.", reply_markup=topup_menu())
+            else:
+                await c.message.edit_text("Тариф недоступен.", reply_markup=main_menu(is_admin=c.from_user.id in settings.ADMIN_IDS))
     await c.answer()
 
 @dp.callback_query(F.data == "admin_open")
@@ -156,7 +173,7 @@ async def admin_open(c: CallbackQuery):
     if c.from_user.id not in settings.ADMIN_IDS:
         await c.answer()
         return
-    await c.message.edit_text("Админ-панель", reply_markup=admin_menu())
+    await c.message.edit_text("🛠 Админ-панель", reply_markup=admin_menu())
     await c.answer()
 
 @dp.callback_query(F.data == "admin_broadcast")
@@ -168,15 +185,13 @@ async def admin_broadcast(c: CallbackQuery, state: FSMContext):
     await c.message.edit_text("Отправьте текст рассылки сообщением", reply_markup=cancel_menu())
     await c.answer()
 
-from app.models import User as UModel
-
 @dp.message(BroadcastState.wait_text)
 async def broadcast_text(m: Message, state: FSMContext):
     if m.from_user.id not in settings.ADMIN_IDS:
         return
     text = m.text
     async with SessionLocal() as s:
-        res = await s.execute(select(UModel.tg_id))
+        res = await s.execute(select(User.tg_id))
         ids = [x for (x,) in res.all()]
     sent = 0
     for uid in ids:
@@ -188,19 +203,53 @@ async def broadcast_text(m: Message, state: FSMContext):
     await state.clear()
     await m.answer(f"Отправлено: {sent}", reply_markup=admin_menu())
 
-from app.repositories.panels import PanelRepository
+@dp.callback_query(F.data == "admin_tariffs")
+async def admin_tariffs(c: CallbackQuery):
+    if c.from_user.id not in settings.ADMIN_IDS:
+        await c.answer()
+        return
+    async with SessionLocal() as s:
+        _, _, _, _, _, _, tariffs = await get_uc(s)
+        items_raw = await tariffs.list_active()
+        items = [(t.id, f"{t.title} • {t.price_rub} ₽") for t in items_raw]
+    await c.message.edit_text("💼 Управление тарифами:\nВыберите тариф для изменения цены.", reply_markup=admin_tariffs_menu(items))
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("admin_set_price:"))
+async def admin_set_price(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id not in settings.ADMIN_IDS:
+        await c.answer()
+        return
+    tid = int(c.data.split(":")[1])
+    await state.update_data(tariff_id=tid)
+    await state.set_state(AdminPriceState.wait_price)
+    await c.message.edit_text("Введите новую цену в ₽ (целое число):", reply_markup=cancel_menu())
+    await c.answer()
+
+@dp.message(AdminPriceState.wait_price)
+async def admin_price_input(m: Message, state: FSMContext):
+    if m.from_user.id not in settings.ADMIN_IDS:
+        return
+    price = int(m.text.strip())
+    data = await state.get_data()
+    tid = int(data["tariff_id"])
+    async with SessionLocal() as s:
+        _, _, _, _, _, _, tariffs = await get_uc(s)
+        await tariffs.set_price(tid, price)
+        await s.commit()
+        items_raw = await tariffs.list_active()
+        items = [(t.id, f"{t.title} • {t.price_rub} ₽") for t in items_raw]
+    await state.clear()
+    await m.answer("Цена обновлена.", reply_markup=admin_tariffs_menu(items))
 
 @dp.callback_query(F.data == "admin_add_panel")
 async def admin_add_panel(c: CallbackQuery, state: FSMContext):
     if c.from_user.id not in settings.ADMIN_IDS:
         await c.answer()
         return
-    from app.bot.states import AddPanelState
     await state.set_state(AddPanelState.wait_title)
     await c.message.edit_text("Введите название панели", reply_markup=cancel_menu())
     await c.answer()
-
-from app.bot.states import AddPanelState
 
 @dp.message(AddPanelState.wait_title)
 async def panel_title(m: Message, state: FSMContext):
@@ -241,9 +290,6 @@ async def panel_domain(m: Message, state: FSMContext):
     await state.clear()
     await m.answer("Панель добавлена", reply_markup=admin_menu())
 
-from app.bot.states import AdminTopupState
-from app.repositories.users import UserRepository as URepo
-
 @dp.callback_query(F.data == "admin_topup_user")
 async def admin_topup_user(c: CallbackQuery, state: FSMContext):
     if c.from_user.id not in settings.ADMIN_IDS:
@@ -265,7 +311,7 @@ async def admin_topup_user_amount(m: Message, state: FSMContext):
     tg_id = int(data["tg_id"])
     amount = int(m.text.strip())
     async with SessionLocal() as s:
-        repo = URepo(s)
+        repo = UserRepository(s)
         await repo.add_balance(tg_id, amount)
         await s.commit()
     await state.clear()

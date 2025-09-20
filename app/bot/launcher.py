@@ -23,7 +23,8 @@ from app.integrations.yookassa import YooKassaClient
 from app.bot.keyboards import main_menu, accept_tos, topup_menu, admin_menu, cancel_menu
 from app.bot.states import BroadcastState, AddPanelState, AdminTopupState
 
-bot = Bot(token=settings.BOT_TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(token=settings.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
 dp = Dispatcher(storage=MemoryStorage())
 
 async def ensure_channel(member_id: int) -> bool:

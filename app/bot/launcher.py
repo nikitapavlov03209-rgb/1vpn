@@ -45,16 +45,26 @@ async def get_uc(session: AsyncSession):
     ykp = YooKassaProvider(payments, yk)
     return users, sservice, panels, payments, cbp, ykp
 
+async def sub_link_for_tg(tg_id: int) -> str:
+    uid = str(tg_id)
+    import hashlib, hmac
+    token = hmac.new(settings.SUBSCRIPTION_SIGN_SECRET.encode(), msg=uid.encode(), digestmod=hashlib.sha256).hexdigest()
+    return f"{settings.BASE_PUBLIC_URL}/webhooks/subscription/{uid}?token={token}"
+
 async def show_main(user_id: int, chat_id: int, edit_message=None):
     async with SessionLocal() as s:
         res = await s.execute(select(User).where(User.tg_id == user_id))
         u = res.scalar_one_or_none()
     is_admin = user_id in settings.ADMIN_IDS
     kb = main_menu(is_admin=is_admin)
+    text = "Главное меню"
+    if u and u.tos_accepted_at:
+        link = await sub_link_for_tg(user_id)
+        text = f"Главное меню\n\nВаша подписка:\n{link}"
     if edit_message:
-        await edit_message.edit_text("Главное меню", reply_markup=kb)
+        await edit_message.edit_text(text, reply_markup=kb)
     else:
-        await bot.send_message(chat_id, "Главное меню", reply_markup=kb)
+        await bot.send_message(chat_id, text, reply_markup=kb)
 
 @dp.message(CommandStart())
 async def start(m: Message):
@@ -129,7 +139,7 @@ async def buy_sub(c: CallbackQuery):
         try:
             link, expires = await subs.buy_with_balance(c.from_user.id, settings.DEFAULT_DAYS)
             await s.commit()
-            await c.message.edit_text(f"Ссылка-подписка:\n{link}\nАктивна до: {expires.date().isoformat()}", reply_markup=main_menu(is_admin=c.from_user.id in settings.ADMIN_IDS))
+            await c.message.edit_text(f"Ваша подписка:\n{link}\nАктивна до: {expires.date().isoformat()}", reply_markup=main_menu(is_admin=c.from_user.id in settings.ADMIN_IDS))
         except ValueError:
             await s.rollback()
             await c.message.edit_text("Недостаточно средств. Пополните баланс.", reply_markup=topup_menu())
@@ -137,7 +147,8 @@ async def buy_sub(c: CallbackQuery):
 
 @dp.callback_query(F.data == "my_sub")
 async def my_sub(c: CallbackQuery):
-    await c.message.edit_text("Если у вас активная подписка, ссылка-подписка остаётся прежней. При продлении срок увеличивается.", reply_markup=main_menu(is_admin=c.from_user.id in settings.ADMIN_IDS))
+    link = await sub_link_for_tg(c.from_user.id)
+    await c.message.edit_text(f"Ваша постоянная ссылка-подписка:\n{link}\nОна автоматически включает ваши активные ключи. При продлении срок действия ключей увеличивается.", reply_markup=main_menu(is_admin=c.from_user.id in settings.ADMIN_IDS))
     await c.answer()
 
 @dp.callback_query(F.data == "admin_open")
@@ -157,13 +168,15 @@ async def admin_broadcast(c: CallbackQuery, state: FSMContext):
     await c.message.edit_text("Отправьте текст рассылки сообщением", reply_markup=cancel_menu())
     await c.answer()
 
+from app.models import User as UModel
+
 @dp.message(BroadcastState.wait_text)
 async def broadcast_text(m: Message, state: FSMContext):
     if m.from_user.id not in settings.ADMIN_IDS:
         return
     text = m.text
     async with SessionLocal() as s:
-        res = await s.execute(select(User.tg_id))
+        res = await s.execute(select(UModel.tg_id))
         ids = [x for (x,) in res.all()]
     sent = 0
     for uid in ids:
@@ -175,14 +188,19 @@ async def broadcast_text(m: Message, state: FSMContext):
     await state.clear()
     await m.answer(f"Отправлено: {sent}", reply_markup=admin_menu())
 
+from app.repositories.panels import PanelRepository
+
 @dp.callback_query(F.data == "admin_add_panel")
 async def admin_add_panel(c: CallbackQuery, state: FSMContext):
     if c.from_user.id not in settings.ADMIN_IDS:
         await c.answer()
         return
+    from app.bot.states import AddPanelState
     await state.set_state(AddPanelState.wait_title)
     await c.message.edit_text("Введите название панели", reply_markup=cancel_menu())
     await c.answer()
+
+from app.bot.states import AddPanelState
 
 @dp.message(AddPanelState.wait_title)
 async def panel_title(m: Message, state: FSMContext):
@@ -223,6 +241,9 @@ async def panel_domain(m: Message, state: FSMContext):
     await state.clear()
     await m.answer("Панель добавлена", reply_markup=admin_menu())
 
+from app.bot.states import AdminTopupState
+from app.repositories.users import UserRepository as URepo
+
 @dp.callback_query(F.data == "admin_topup_user")
 async def admin_topup_user(c: CallbackQuery, state: FSMContext):
     if c.from_user.id not in settings.ADMIN_IDS:
@@ -244,7 +265,7 @@ async def admin_topup_user_amount(m: Message, state: FSMContext):
     tg_id = int(data["tg_id"])
     amount = int(m.text.strip())
     async with SessionLocal() as s:
-        repo = UserRepository(s)
+        repo = URepo(s)
         await repo.add_balance(tg_id, amount)
         await s.commit()
     await state.clear()

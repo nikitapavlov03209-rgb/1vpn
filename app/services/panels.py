@@ -1,4 +1,3 @@
-# app/services/panels.py
 import datetime as dt
 from typing import List
 from app.repositories.panels import PanelRepository
@@ -16,9 +15,9 @@ class PanelService:
             client = XUIPanelClient(p.base_url, p.username, p.password, p.domain)
             try:
                 inbounds = await client.list_inbounds()
-                ids = [ib.get("id") or ib.get("Id") for ib in inbounds if ib]
+                ids = [ib.get("id") or ib.get("Id") for ib in inbounds if (ib and ib.get("protocol") in ("vless", "VLESS"))]
                 for inbound_id in filter(lambda x: isinstance(x, int), ids):
-                    await client.add_client_to_inbound(inbound_id, uid, expires)
+                    await client.add_vless_client(inbound_id, uid, expires)
                 urls.append(await client.subscription_url(uid))
             finally:
                 await client.close()

@@ -1,6 +1,7 @@
 import json
 import httpx
 import datetime as dt
+import uuid as pyuuid
 from typing import Any, List, Optional
 
 class XUIPanelClient:
@@ -42,9 +43,7 @@ class XUIPanelClient:
             url = f"{self.base_url}{pref}{path}"
             try:
                 r = await self._client.post(url, json=json_body, cookies=self._cookies)
-                if r.status_code in (200, 204):
-                    return r
-                if r.status_code == 400 or r.status_code == 409:
+                if r.status_code in (200, 204, 400, 409):
                     return r
             except Exception as e:
                 last_exc = e
@@ -60,22 +59,21 @@ class XUIPanelClient:
         items = data.get("obj") or data.get("data") or []
         return items if isinstance(items, list) else []
 
-    async def add_client_to_inbound(self, inbound_id: int, uid: str, expire_at: dt.datetime) -> dict[str, Any]:
+    async def add_vless_client(self, inbound_id: int, uid: str, expire_at: dt.datetime) -> dict[str, Any]:
         await self._ensure()
         ms = int(expire_at.timestamp() * 1000)
-        settings = {
-            "clients": [
-                {
-                    "email": f"{uid}@{self.domain}",
-                    "enable": True,
-                    "expiryTime": ms,
-                    "limitIp": 0,
-                    "totalGB": 0,
-                    "flow": ""
-                }
-            ]
+        cid = str(pyuuid.uuid4())
+        client_obj = {
+            "email": f"{uid}@{self.domain}",
+            "enable": True,
+            "expiryTime": ms,
+            "limitIp": 0,
+            "totalGB": 0,
+            "flow": "",
+            "id": cid,
+            "uuid": cid
         }
-        payload = {"id": inbound_id, "settings": json.dumps(settings, separators=(",", ":"))}
+        payload = {"id": inbound_id, "settings": json.dumps({"clients": [client_obj]}, separators=(",", ":"))}
         r = await self._try_post("/api/inbounds/addClient", json_body=payload)
         r.raise_for_status()
         return r.json()

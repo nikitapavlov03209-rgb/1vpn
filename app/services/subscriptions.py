@@ -1,7 +1,6 @@
 import hashlib
 import hmac
 import datetime as dt
-from typing import List
 from app.repositories.subscriptions import SubscriptionRepository
 from app.repositories.users import UserRepository
 from app.services.panels import PanelService
@@ -21,7 +20,7 @@ class SubscriptionService:
         user.balance -= price
         sub = await self.subs.create_or_extend(user.id, days)
         uid = str(user.tg_id)
-        urls = await self.panels.provision_user(uid, days)
+        await self.panels.provision_user(uid, days)
         token = self._sign(uid)
         link = f"{settings.BASE_PUBLIC_URL}/webhooks/subscription/{uid}?token={token}"
         return link, sub.expires_at

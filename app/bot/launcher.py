@@ -42,7 +42,7 @@ async def ensure_channel(member_id: int) -> bool:
     try:
         m = await bot.get_chat_member(settings.REQUIRED_CHANNEL, member_id)
         return m.status in ("member", "creator", "administrator")
-    except:  # noqa: E722
+    except:
         return False
 
 async def get_uc(session: AsyncSession):
@@ -68,10 +68,8 @@ async def sub_link_for_tg(tg_id: int) -> str:
 
 async def safe_edit(message, text: str, reply_markup=None):
     try:
-        # Пробуем обновить текст (экономим чат)
         await message.edit_text(text, reply_markup=reply_markup)
     except TelegramBadRequest as e:
-        # Если контент идентичен — отправляем новое сообщение
         if "message is not modified" in str(e):
             await message.answer(text, reply_markup=reply_markup)
         else:
@@ -131,8 +129,8 @@ async def profile(c: CallbackQuery):
     text = (
         "👤 Профиль\n\n"
         f"🔗 Ваша постоянная ссылка-подписка:\n{link}\n\n"
-        "ℹ️ Ссылка автоматически включает все ваши активные ключи. "
-        "После окончания срока подписки ключи перестанут работать."
+        "ℹ️ Если открывается пусто: либо нет активной подписки, либо панели ещё не вернули узлы. "
+        "Можете проверить по /webhooks/subscription/debug/<ваш_id>?token=..."
     )
     await safe_edit(c.message, text, reply_markup=main_menu(is_admin=c.from_user.id in settings.ADMIN_IDS))
     await c.answer()
@@ -230,7 +228,7 @@ async def broadcast_text(m: Message, state: FSMContext):
         try:
             await bot.send_message(uid, text)
             sent += 1
-        except:  # noqa: E722
+        except:
             pass
     await state.clear()
     await m.answer(f"Отправлено: {sent}", reply_markup=admin_menu())

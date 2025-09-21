@@ -1,5 +1,6 @@
+from typing import Optional
 import datetime as dt
-from sqlalchemy import select
+from sqlalchemy import select, update, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import Subscription
 
@@ -7,18 +8,26 @@ class SubscriptionRepository:
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    async def create_or_extend(self, user_id: int, days: int) -> Subscription:
-        now = dt.datetime.utcnow()
+    async def get_active_for_user(self, user_id: int) -> Optional[Subscription]:
         res = await self.session.execute(
             select(Subscription).where(Subscription.user_id == user_id, Subscription.status == "active")
         )
-        sub = res.scalar_one_or_none()
-        if sub and sub.expires_at > now:
-            sub.expires_at = sub.expires_at + dt.timedelta(days=days)
-            await self.session.flush()
-            return sub
-        expires = now + dt.timedelta(days=days)
-        sub = Subscription(user_id=user_id, expires_at=expires, status="active", created_at=now)
-        self.session.add(sub)
-        await self.session.flush()
-        return sub
+        return res.scalar_one_or_none()
+
+    async def deactivate_all_for_user(self, user_id: int) -> None:
+        await self.session.execute(
+            update(Subscription)
+            .where(Subscription.user_id == user_id, Subscription.status == "active")
+            .values(status="expired")
+        )
+
+    async def activate_for_user(self, user_id: int, expires_at: dt.datetime) -> Subscription:
+        await self.deactivate_all_for_user(user_id)
+        res = await self.session.execute(
+            insert(Subscription).values(
+                user_id=user_id,
+                status="active",
+                expires_at=expires_at,
+            ).returning(Subscription)
+        )
+        return res.scalar_one()

@@ -1,4 +1,3 @@
-import asyncio
 import hashlib
 import hmac
 from html import escape as h
@@ -14,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.config import settings
 from app.db import SessionLocal
-from app.models import User, User as UModel
+from app.models import User, User as UModel, Panel as PModel
 from app.repositories.users import UserRepository, UserRepository as URepo
 from app.repositories.panels import PanelRepository
 from app.repositories.payments import PaymentRepository
@@ -33,6 +32,7 @@ from app.bot.keyboards import (
     cancel_menu,
     tariffs_menu,
     admin_tariffs_menu,
+    admin_panels_menu,
 )
 from app.bot.states import BroadcastState, AddPanelState, AdminTopupState, AdminPriceState
 
@@ -132,8 +132,6 @@ async def profile(c: CallbackQuery):
     text = (
         "👤 Профиль\n\n"
         f"🔗 Ваша постоянная ссылка-подписка:\n<code>{h(sub)}</code>\n\n"
-        "ℹ️ При активной подписке здесь вернётся список узлов. "
-        "Если в браузере пусто — либо подписка не активна, либо панели пока не выдают узлы.\n\n"
         f"🧪 Отладка:\n<code>{h(dbg)}</code>"
     )
     await safe_edit(c.message, text, reply_markup=main_menu(is_admin=c.from_user.id in settings.ADMIN_IDS))
@@ -323,6 +321,56 @@ async def panel_domain(m: Message, state: FSMContext):
         await s.commit()
     await state.clear()
     await m.answer("Панель добавлена", reply_markup=admin_menu())
+
+@dp.callback_query(F.data == "admin_list_panels")
+async def admin_list_panels(c: CallbackQuery):
+    if c.from_user.id not in settings.ADMIN_IDS:
+        await c.answer()
+        return
+    async with SessionLocal() as s:
+        repo = PanelRepository(s)
+        items = await repo.list_all()
+        view = [(p.id, f"{p.id} • {p.title}") for p in items]
+    await safe_edit(c.message, "📋 Подключенные панели:", reply_markup=admin_panels_menu(view))
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("admin_panel_view:"))
+async def admin_panel_view(c: CallbackQuery):
+    if c.from_user.id not in settings.ADMIN_IDS:
+        await c.answer()
+        return
+    pid = int(c.data.split(":")[1])
+    async with SessionLocal() as s:
+        repo = PanelRepository(s)
+        p = await repo.get(pid)
+    if not p:
+        await c.answer()
+        return
+    text = (
+        "ℹ️ Панель\n\n"
+        f"ID: {p.id}\n"
+        f"Название: {p.title}\n"
+        f"base_url: {p.base_url}\n"
+        f"domain: {p.domain}\n"
+        f"active: {bool(p.active)}"
+    )
+    await safe_edit(c.message, text, reply_markup=admin_menu())
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("admin_panel_delete:"))
+async def admin_panel_delete(c: CallbackQuery):
+    if c.from_user.id not in settings.ADMIN_IDS:
+        await c.answer()
+        return
+    pid = int(c.data.split(":")[1])
+    async with SessionLocal() as s:
+        repo = PanelRepository(s)
+        await repo.delete(pid)
+        await s.commit()
+        items = await repo.list_all()
+        view = [(p.id, f"{p.id} • {p.title}") for p in items]
+    await safe_edit(c.message, "✅ Панель удалена.\n\n📋 Подключенные панели:", reply_markup=admin_panels_menu(view))
+    await c.answer()
 
 @dp.callback_query(F.data == "admin_topup_user")
 async def admin_topup_user(c: CallbackQuery, state: FSMContext):

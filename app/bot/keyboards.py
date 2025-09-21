@@ -51,6 +51,11 @@ def admin_menu() -> InlineKeyboardMarkup:
         ]
     )
 
+def admin_tariffs_menu(items: list[tuple[int, str]]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"admin_set_price:{tid}")] for tid, label in items]
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_open")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 def admin_panels_menu(items: list[tuple[int, str]]) -> InlineKeyboardMarkup:
     rows = []
     for pid, title in items:
